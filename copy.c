@@ -15,13 +15,19 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
 /* Extracted from cp.c and librarified by Jim Meyering.  */
-
+#define _GNU_SOURCE
 #include <config.h>
 #include <stdio.h>
 #include <assert.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <selinux/selinux.h>
+#include <libaio.h>
+#include <math.h>
+
+// AIO configurations (\TODO: tune)
+#define AIO_BLKSIZE (64*1024)
+#define AIO_MAXIO   32
 
 #if HAVE_HURD_H
 # include <hurd.h>
@@ -128,7 +134,6 @@ struct dir_list
   ino_t ino;
   dev_t dev;
 };
-
 /* Initial size of the cp.dest_info hash table.  */
 #define DEST_INFO_INITIAL_CAPACITY 61
 
@@ -244,6 +249,58 @@ create_hole (int fd, char const *name, bool punch_holes, off_t size)
   return true;
 }
 
+// AIO utils
+/*
+* Write complete callback.
+* Adjust counts and free resources
+*/
+static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2, int dst_fd)
+{
+    if (res2 != 0) {
+      fprintf(stderr, "res2 aio error %d got %d\n", iocb->u.c.nbytes, res2);
+      exit(1);
+    }
+    if (res != iocb->u.c.nbytes) {
+    fprintf(stderr, "write missed bytes expect %d got %d\n", iocb->u.c.nbytes, res2);
+    exit(1);
+    }
+    // --tocopy;
+    // --busy;
+    free(iocb->u.c.buf);
+    memset(iocb, 0xff, sizeof(iocb));   // paranoia
+    free(iocb);
+    // write(2, "w", 1);
+}
+
+/*
+* Read complete callback.
+* Change read iocb into a write iocb and start it.
+*/
+static void rd_done(io_context_t ctx, struct iocb *iocb, long res, long res2, int dst_fd)
+{
+    /* library needs accessors to look at iocb? */
+    int iosize = iocb->u.c.nbytes;
+    char *buf = iocb->u.c.buf;
+    off_t offset = iocb->u.c.offset;
+
+    if (res2 != 0) {
+      fprintf(stderr, "res 2 not zero in aio_read callback, %d got %d\n", iocb->u.c.nbytes, res);
+      exit(1);
+    }
+    if (res != iosize) {
+    fprintf(stderr, "read missing bytes expect %d got %d\n", iocb->u.c.nbytes, res);
+    exit(1);
+    }
+
+    /* turn read into write */
+    io_prep_pwrite(iocb, dst_fd, buf, iosize, offset);
+    io_set_callback(iocb, wr_done);
+    if (1 != (res = io_submit(ctx, 1, &iocb))) {
+      fprintf(stderr, "io submit error %d got %d\n", iocb->u.c.nbytes, res);
+      exit(1);
+    }
+    // write(2, "r", 1);
+}
 
 /* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
    honoring the MAKE_HOLES setting and using the BUF_SIZE-byte buffer
@@ -261,12 +318,94 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
              size_t hole_size, bool punch_holes,
              char const *src_name, char const *dst_name,
              uintmax_t max_n_read, off_t *total_n_read,
+             int start_offset, //AIO
              bool *last_write_made_hole)
 {
   *last_write_made_hole = false;
   *total_n_read = 0;
   bool make_hole = false;
   off_t psize = 0;
+
+  // AIO
+  static int busy = 0;          // # of I/O's in flight
+  static int tocopy = 0;        // # of blocks left to copy
+  struct stat sb;
+  struct stat src_open_sb;
+  io_context_t aio_ctx;
+  off_t length = 0, offset = start_offset;
+
+
+  
+  if (fstat (src_fd, &src_open_sb) != 0)
+  {
+      error (0, errno, _("cannot fstat %s"), quoteaf (src_name));
+      return false;
+  }
+  length = MIN(src_open_sb.st_size, max_n_read);
+  memset(&aio_ctx, 0, sizeof(aio_ctx));
+  if (io_queue_init(AIO_MAXIO, &aio_ctx) != 0) {
+    error (0, errno, _("cannot aio_queue_init %s"), quoteaf (src_name));
+    return false;
+  }
+
+  tocopy = length / AIO_BLKSIZE;
+  if (length % AIO_BLKSIZE > 0) tocopy++;
+  while (tocopy > 0) {
+    int i, rc, remaining;
+    remaining = (length - offset) / AIO_BLKSIZE;
+    if ((length - offset) % AIO_BLKSIZE > 0) remaining++;
+    int n = MIN(AIO_MAXIO - busy, remaining);
+    if (n > 0) {
+      struct iocb *ioq[n];
+      for (i = 0; i < n; i++) {
+        struct iocb *io = (struct iocb *) malloc(sizeof(struct iocb));
+        char *aio_buffer = NULL;
+	      posix_memalign((void **)&aio_buffer, 512, AIO_BLKSIZE);
+        if (NULL == aio_buffer || NULL == io) {
+          fprintf(stderr, "out of memory\n");
+          return false;
+        }
+        io_prep_pread(io, src_fd, aio_buffer, AIO_BLKSIZE, offset);
+        io_set_callback(io, rd_done);
+        ioq[i] = io;
+        offset += AIO_BLKSIZE;
+      }
+
+      rc = io_submit(myctx, n, ioq);
+      if (rc < 0) {
+        fprintf(stderr, "io_submit error!\n");
+        return false;
+      }
+      busy += n;
+    }
+
+    //customized aio run
+    static struct timespec timeout = { 0, 0 };
+    struct io_event event;
+    int io_q_run_r;
+    while (1 == (io_q_run_r = io_getevents(ctx, 0, 1, &event, &timeout))) {
+        io_callback_t cb = (io_callback_t)event.data;
+        struct iocb *iocb = event.obj;
+
+        cb(ctx, iocb, event.res, event.res2);
+        // \TODO iocb may contains event type (read, write)
+    }
+    if (io_q_run_r < 0) {
+      fprintf(stderr, "io_queue_run error\n");
+      return false;
+    }
+
+    // customized aio q wait
+    if (busy == AIO_MAXIO) {
+      rc = io_getevents(aio_ctx, 0, 0, NULL, NULL);
+      if (rc < 0) {
+        fprintf(stderr, "io_get_event_waiting_for_at_least_one error\n");
+        return false;
+      }
+    }
+  }
+
+
 
   while (max_n_read)
     {
@@ -556,6 +695,7 @@ extent_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
               if ( ! sparse_copy (src_fd, dest_fd, buf, buf_size,
                                   sparse_mode == SPARSE_ALWAYS ? hole_size: 0,
                                   true, src_name, dst_name, ext_len, &n_read,
+                                  dest_pos,
                                   &read_hole))
                 goto fail;
 
@@ -1065,7 +1205,7 @@ copy_reg (char const *src_name, char const *dst_name,
   bool data_copy_required = x->data_copy_required;
 
   source_desc = open (src_name,
-                      (O_RDONLY | O_BINARY
+                      (O_RDONLY | O_BINARY | O_DIRECT
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
   if (source_desc < 0)
     {
@@ -1096,7 +1236,7 @@ copy_reg (char const *src_name, char const *dst_name,
   if (! *new_dst)
     {
       int open_flags =
-        O_WRONLY | O_BINARY | (x->data_copy_required ? O_TRUNC : 0);
+        O_WRONLY | O_BINARY | O_DIRECT | (x->data_copy_required ? O_TRUNC : 0);
       dest_desc = open (dst_name, open_flags);
       dest_errno = errno;
 
@@ -1153,11 +1293,11 @@ copy_reg (char const *src_name, char const *dst_name,
     {
     open_with_O_CREAT:;
 
-      int open_flags = O_WRONLY | O_CREAT | O_BINARY;
+      int open_flags = O_WRONLY | O_CREAT | O_BINARY | O_DIRECT;
       dest_desc = open (dst_name, open_flags | O_EXCL,
                         dst_mode & ~omitted_permissions);
       dest_errno = errno;
-
+      
       /* When trying to copy through a dangling destination symlink,
          the above open fails with EEXIST.  If that happens, and
          lstat'ing the DST_NAME shows that it is a symlink, then we
@@ -1225,6 +1365,13 @@ copy_reg (char const *src_name, char const *dst_name,
       return_val = false;
       goto close_src_desc;
     }
+
+  if (ftruncate(dest_desc, src_open_sb.st_size) != 0)
+      {
+        error (0, errno, _("cannot ftruncate %s"), quoteaf (dst_name));
+        return_val = false;
+        goto close_src_and_dst_desc;
+      }
 
   if (fstat (dest_desc, &sb) != 0)
     {
@@ -1332,6 +1479,7 @@ copy_reg (char const *src_name, char const *dst_name,
                          make_holes ? hole_size : 0,
                          x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
                          UINTMAX_MAX, &n_read,
+                         0,
                          &wrote_hole_at_eof))
         {
           return_val = false;
@@ -3009,6 +3157,7 @@ copy (char const *src_name, char const *dst_name,
       bool *copy_into_self, bool *rename_succeeded)
 {
   assert (valid_options (options));
+  fprintf(stderr, "DEBUGGGGGG, copy main function get called.\n"); 
 
   /* Record the file names: they're used in case of error, when copying
      a directory into itself.  I don't like to make these tools do *any*
