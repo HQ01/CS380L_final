@@ -137,6 +137,8 @@ struct dir_list
 /* Initial size of the cp.dest_info hash table.  */
 #define DEST_INFO_INITIAL_CAPACITY 61
 
+typedef void (*aio_cb_t) (io_context_t, struct iocb*, long, long, int);
+
 static bool copy_internal (char const *src_name, char const *dst_name,
                            bool new_dst, struct stat const *parent,
                            struct dir_list *ancestors,
@@ -257,11 +259,11 @@ create_hole (int fd, char const *name, bool punch_holes, off_t size)
 static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2, int dst_fd)
 {
     if (res2 != 0) {
-      fprintf(stderr, "res2 aio error %d got %d\n", iocb->u.c.nbytes, res2);
+      fprintf(stderr, "res2 aio error %ld got %ld\n", iocb->u.c.nbytes, res2);
       exit(1);
     }
     if (res != iocb->u.c.nbytes) {
-    fprintf(stderr, "write missed bytes expect %d got %d\n", iocb->u.c.nbytes, res2);
+    fprintf(stderr, "write missed bytes expect %ld got %ld\n", iocb->u.c.nbytes, res2);
     exit(1);
     }
     // --tocopy;
@@ -284,19 +286,20 @@ static void rd_done(io_context_t ctx, struct iocb *iocb, long res, long res2, in
     off_t offset = iocb->u.c.offset;
 
     if (res2 != 0) {
-      fprintf(stderr, "res 2 not zero in aio_read callback, %d got %d\n", iocb->u.c.nbytes, res);
+      fprintf(stderr, "res 2 not zero in aio_read callback, %ld got %ld\n", iocb->u.c.nbytes, res);
       exit(1);
     }
     if (res != iosize) {
-    fprintf(stderr, "read missing bytes expect %d got %d\n", iocb->u.c.nbytes, res);
+    fprintf(stderr, "read missing bytes expect %ld got %ld\n", iocb->u.c.nbytes, res);
     exit(1);
     }
 
     /* turn read into write */
     io_prep_pwrite(iocb, dst_fd, buf, iosize, offset);
-    io_set_callback(iocb, wr_done);
+    iocb->data = (void*) wr_done;
+    // io_set_callback(iocb, wr_done);
     if (1 != (res = io_submit(ctx, 1, &iocb))) {
-      fprintf(stderr, "io submit error %d got %d\n", iocb->u.c.nbytes, res);
+      fprintf(stderr, "io submit error %ld got %ld\n", iocb->u.c.nbytes, res);
       exit(1);
     }
     // write(2, "r", 1);
@@ -365,13 +368,15 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
           fprintf(stderr, "out of memory\n");
           return false;
         }
-        io_prep_pread(io, src_fd, aio_buffer, AIO_BLKSIZE, offset);
-        io_set_callback(io, rd_done);
+        int io_size = MIN(length - offset, AIO_BLKSIZE);
+        io_prep_pread(io, src_fd, aio_buffer, io_size, offset);
+        io->data = (void*)rd_done;
+        //io_set_callback(io, rd_done);
         ioq[i] = io;
-        offset += AIO_BLKSIZE;
+        offset += io_size;
       }
 
-      rc = io_submit(myctx, n, ioq);
+      rc = io_submit(aio_ctx, n, ioq);
       if (rc < 0) {
         fprintf(stderr, "io_submit error!\n");
         return false;
@@ -383,12 +388,17 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
     static struct timespec timeout = { 0, 0 };
     struct io_event event;
     int io_q_run_r;
-    while (1 == (io_q_run_r = io_getevents(ctx, 0, 1, &event, &timeout))) {
-        io_callback_t cb = (io_callback_t)event.data;
+    while (1 == (io_q_run_r = io_getevents(aio_ctx, 0, 1, &event, &timeout))) {
+        // io_callback_t cb = (io_callback_t)event.data;
         struct iocb *iocb = event.obj;
+        aio_cb_t cb = (aio_cb_t)iocb->data;
 
-        cb(ctx, iocb, event.res, event.res2);
-        // \TODO iocb may contains event type (read, write)
+        cb(aio_ctx, iocb, event.res, event.res2, dest_fd);
+        if (iocb->aio_lio_opcode == IO_CMD_PWRITE) {
+          --tocopy;
+          --busy;
+          *total_n_read += event.res;
+        }
     }
     if (io_q_run_r < 0) {
       fprintf(stderr, "io_queue_run error\n");
@@ -407,98 +417,99 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
 
 
 
-  while (max_n_read)
-    {
-      ssize_t n_read = read (src_fd, buf, MIN (max_n_read, buf_size));
-      if (n_read < 0)
-        {
-          if (errno == EINTR)
-            continue;
-          error (0, errno, _("error reading %s"), quoteaf (src_name));
-          return false;
-        }
-      if (n_read == 0)
-        break;
-      max_n_read -= n_read;
-      *total_n_read += n_read;
+  // while (max_n_read)
+  //   {
+  //     ssize_t n_read = read (src_fd, buf, MIN (max_n_read, buf_size));
+  //     if (n_read < 0)
+  //       {
+  //         if (errno == EINTR)
+  //           continue;
+  //         error (0, errno, _("error reading %s"), quoteaf (src_name));
+  //         return false;
+  //       }
+  //     if (n_read == 0)
+  //       break;
+  //     max_n_read -= n_read;
+  //     *total_n_read += n_read;
 
-      /* Loop over the input buffer in chunks of hole_size.  */
-      size_t csize = hole_size ? hole_size : buf_size;
-      char *cbuf = buf;
-      char *pbuf = buf;
+  //     /* Loop over the input buffer in chunks of hole_size.  */
+  //     size_t csize = hole_size ? hole_size : buf_size;
+  //     char *cbuf = buf;
+  //     char *pbuf = buf;
 
-      while (n_read)
-        {
-          bool prev_hole = make_hole;
-          csize = MIN (csize, n_read);
+  //     while (n_read)
+  //       {
+  //         bool prev_hole = make_hole;
+  //         csize = MIN (csize, n_read);
 
-          if (hole_size && csize)
-            make_hole = is_nul (cbuf, csize);
+  //         if (hole_size && csize)
+  //           make_hole = is_nul (cbuf, csize);
 
-          bool transition = (make_hole != prev_hole) && psize;
-          bool last_chunk = (n_read == csize && ! make_hole) || ! csize;
+  //         bool transition = (make_hole != prev_hole) && psize;
+  //         bool last_chunk = (n_read == csize && ! make_hole) || ! csize;
 
-          if (transition || last_chunk)
-            {
-              if (! transition)
-                psize += csize;
+  //         if (transition || last_chunk)
+  //           {
+  //             if (! transition)
+  //               psize += csize;
 
-              if (! prev_hole)
-                {
-                  if (full_write (dest_fd, pbuf, psize) != psize)
-                    {
-                      error (0, errno, _("error writing %s"),
-                             quoteaf (dst_name));
-                      return false;
-                    }
-                }
-              else
-                {
-                  if (! create_hole (dest_fd, dst_name, punch_holes, psize))
-                    return false;
-                }
+  //             if (! prev_hole)
+  //               {
+  //                 if (full_write (dest_fd, pbuf, psize) != psize)
+  //                   {
+  //                     error (0, errno, _("error writing %s"),
+  //                            quoteaf (dst_name));
+  //                     return false;
+  //                   }
+  //               }
+  //             else
+  //               {
+  //                 if (! create_hole (dest_fd, dst_name, punch_holes, psize))
+  //                   return false;
+  //               }
 
-              pbuf = cbuf;
-              psize = csize;
+  //             pbuf = cbuf;
+  //             psize = csize;
 
-              if (last_chunk)
-                {
-                  if (! csize)
-                    n_read = 0; /* Finished processing buffer.  */
+  //             if (last_chunk)
+  //               {
+  //                 if (! csize)
+  //                   n_read = 0; /* Finished processing buffer.  */
 
-                  if (transition)
-                    csize = 0;  /* Loop again to deal with last chunk.  */
-                  else
-                    psize = 0;  /* Reset for next read loop.  */
-                }
-            }
-          else  /* Coalesce writes/seeks.  */
-            {
-              if (INT_ADD_WRAPV (psize, csize, &psize))
-                {
-                  error (0, 0, _("overflow reading %s"), quoteaf (src_name));
-                  return false;
-                }
-            }
+  //                 if (transition)
+  //                   csize = 0;  /* Loop again to deal with last chunk.  */
+  //                 else
+  //                   psize = 0;  /* Reset for next read loop.  */
+  //               }
+  //           }
+  //         else  /* Coalesce writes/seeks.  */
+  //           {
+  //             if (INT_ADD_WRAPV (psize, csize, &psize))
+  //               {
+  //                 error (0, 0, _("overflow reading %s"), quoteaf (src_name));
+  //                 return false;
+  //               }
+  //           }
 
-          n_read -= csize;
-          cbuf += csize;
-        }
+  //         n_read -= csize;
+  //         cbuf += csize;
+  //       }
 
-      *last_write_made_hole = make_hole;
+  //     *last_write_made_hole = make_hole;
 
-      /* It's tempting to break early here upon a short read from
-         a regular file.  That would save the final read syscall
-         for each file.  Unfortunately that doesn't work for
-         certain files in /proc or /sys with linux kernels.  */
-    }
+  //     /* It's tempting to break early here upon a short read from
+  //        a regular file.  That would save the final read syscall
+  //        for each file.  Unfortunately that doesn't work for
+  //        certain files in /proc or /sys with linux kernels.  */
+  //   }
 
-  /* Ensure a trailing hole is created, so that subsequent
-     calls of sparse_copy() start at the correct offset.  */
-  if (make_hole && ! create_hole (dest_fd, dst_name, punch_holes, psize))
-    return false;
-  else
-    return true;
+  // /* Ensure a trailing hole is created, so that subsequent
+  //    calls of sparse_copy() start at the correct offset.  */
+  // if (make_hole && ! create_hole (dest_fd, dst_name, punch_holes, psize))
+  //   return false;
+  // else
+  //   return true;
+  return true;
 }
 
 /* Perform the O(1) btrfs clone operation, if possible.
