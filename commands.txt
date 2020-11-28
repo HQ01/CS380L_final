@@ -1,0 +1,1 @@
+gcc -I ../coreutils-8.32/lib/ -I ../coreutils-8.32/src/ -I ../coreutils-8.32/ -L ../coreutils-8.32/lib/ -L ../coreutils-8.32/src/ -o mycp copy.c cp.c cp-hash.c extent-scan.c force-link.c selinux.c -lcoreutils -lver -lcrypt -laio -lselinux

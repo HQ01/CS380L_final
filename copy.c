@@ -354,6 +354,7 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
   tocopy = length / AIO_BLKSIZE;
   if (length % AIO_BLKSIZE > 0) tocopy++;
   while (tocopy > 0) {
+    printf("aio cp get called!\n");
     int i, rc, remaining;
     remaining = (length - offset) / AIO_BLKSIZE;
     if ((length - offset) % AIO_BLKSIZE > 0) remaining++;
