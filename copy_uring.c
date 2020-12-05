@@ -22,12 +22,8 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <selinux/selinux.h>
-#include <libaio.h>
+#include <liburing.h>
 #include <math.h>
-
-// AIO configurations (\TODO: tune)
-#define AIO_BLKSIZE (64*1024)
-#define AIO_MAXIO   32
 
 #if HAVE_HURD_H
 # include <hurd.h>
@@ -137,7 +133,85 @@ struct dir_list
 /* Initial size of the cp.dest_info hash table.  */
 #define DEST_INFO_INITIAL_CAPACITY 61
 
-typedef void (*aio_cb_t) (io_context_t, struct iocb*, long, long, int);
+/* AIO configurations */
+#define AIO_BLKSIZE (128 * 1024)    // I/O block size
+#define QD 64                       // I/O queue depth
+
+struct aio_data {
+    int src_fd;
+    int dst_fd;
+    off_t offset;
+    int buf_index;
+    bool is_read;
+    char const *src_name;
+    char const *dst_name;
+};
+
+struct io_uring aio_ring;
+int inflight = 0;
+
+/* AIO buffer queue */
+int aio_buf_queue[QD];
+struct iovec aio_buf[QD];
+int aio_buf_qhead, aio_buf_qtail;
+
+int aio_buf_queue_init() {
+    aio_buf_qhead = 0;
+    aio_buf_qtail = QD - 1;
+    for (int i = 0; i < QD; i++) 
+    {
+        // allocate AIO buffer
+        aio_buf[i].iov_base = NULL;
+        aio_buf[i].iov_base = malloc(AIO_BLKSIZE);
+        if (aio_buf[i].iov_base == NULL)
+        {
+            fprintf(stderr, "error allocating AIO buffer\n");
+            return -1;
+        }
+        aio_buf[i].iov_len = AIO_BLKSIZE;
+        memset(aio_buf[i].iov_base, 0, AIO_BLKSIZE);
+
+        // initialize buffer queue
+        aio_buf_queue[i] = i;
+    }
+    return 0;
+}
+
+void aio_buf_queue_destroy()
+{
+    for (int i = 0; i < QD; i++)
+        free(aio_buf[i].iov_base);
+}
+
+int aio_buf_enqueue(int buf_index) 
+{
+    int tmp = aio_buf_qtail;
+    aio_buf_qtail = (aio_buf_qtail + 1) % QD;
+    if (aio_buf_queue[aio_buf_qtail] >= 0) 
+    {
+        aio_buf_qtail = tmp;
+        return -1;
+    }
+    aio_buf_queue[aio_buf_qtail] = buf_index;
+    return 0;
+}
+
+int aio_buf_dequeue() 
+{
+    if (aio_buf_queue[aio_buf_qhead] < 0) return -1;
+    int buf_index = aio_buf_queue[aio_buf_qhead];
+    aio_buf_queue[aio_buf_qhead] = -1;
+    aio_buf_qhead = (aio_buf_qhead + 1) % QD;
+    return buf_index;
+}
+
+/* AIO utils */
+void aio_exit(bool fatal_error);
+void aio_free_data(struct aio_data *data);
+void aio_prep_rw(struct aio_data *data);
+int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp);
+int aio_wait_all_comp();
+
 
 static bool copy_internal (char const *src_name, char const *dst_name,
                            bool new_dst, struct stat const *parent,
@@ -251,58 +325,122 @@ create_hole (int fd, char const *name, bool punch_holes, off_t size)
   return true;
 }
 
-// AIO utils
-/*
-* Write complete callback.
-* Adjust counts and free resources
-*/
-static void wr_done(io_context_t ctx, struct iocb *iocb, long res, long res2, int dst_fd)
+/* AIO utils: exit AIO
+   If fatal AIO error occurs, such as errors in getting/releasing buffer
+   and getting completed requests, the program will exit.
+   Otherwise destroy AIO buffer queue and exit AIO normally.  */
+void aio_exit(bool fatal_error)
 {
-    if (res2 != 0) {
-      fprintf(stderr, "res2 aio error %ld got %ld\n", iocb->u.c.nbytes, res2);
-      exit(1);
-    }
-    if (res != iocb->u.c.nbytes) {
-    fprintf(stderr, "write missed bytes expect %ld got %ld\n", iocb->u.c.nbytes, res2);
-    exit(1);
-    }
-    // --tocopy;
-    // --busy;
-    free(iocb->u.c.buf);
-    memset(iocb, 0xff, sizeof(iocb));   // paranoia
-    free(iocb);
-    // write(2, "w", 1);
+  io_uring_queue_exit(&aio_ring);
+  aio_buf_queue_destroy();
+
+  if (fatal_error) exit(1);
 }
 
-/*
-* Read complete callback.
-* Change read iocb into a write iocb and start it.
-*/
-static void rd_done(io_context_t ctx, struct iocb *iocb, long res, long res2, int dst_fd)
+/* AIO utils: free AIO data and release buffer back to queue */
+void aio_free_data(struct aio_data *data)
 {
-    /* library needs accessors to look at iocb? */
-    int iosize = iocb->u.c.nbytes;
-    char *buf = iocb->u.c.buf;
-    off_t offset = iocb->u.c.offset;
+  if (aio_buf_enqueue(data->buf_index) < 0) 
+    {
+      fprintf(stderr, "error releasing buffer back to AIO buffer queue\n");
+      aio_exit(true);
+    } 
+  free(data);
+  inflight--;
+}
 
-    if (res2 != 0) {
-      fprintf(stderr, "res 2 not zero in aio_read callback, %ld got %ld\n", iocb->u.c.nbytes, res);
-      exit(1);
-    }
-    if (res != iosize) {
-    fprintf(stderr, "read missing bytes expect %ld got %ld\n", iocb->u.c.nbytes, res);
-    exit(1);
-    }
+/* AIO utils: prepare for read/write */
+void aio_prep_rw(struct aio_data *data) 
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
+    if (data->is_read)
+        io_uring_prep_readv(sqe, data->src_fd, &aio_buf[data->buf_index], 1, data->offset);
+    else 
+        io_uring_prep_writev(sqe, data->dst_fd, &aio_buf[data->buf_index], 1, data->offset);
+    io_uring_sqe_set_data(sqe, data);
+}
 
-    /* turn read into write */
-    io_prep_pwrite(iocb, dst_fd, buf, iosize, offset);
-    iocb->data = (void*) wr_done;
-    // io_set_callback(iocb, wr_done);
-    if (1 != (res = io_submit(ctx, 1, &iocb))) {
-      fprintf(stderr, "io submit error %ld got %ld\n", iocb->u.c.nbytes, res);
-      exit(1);
+/* AIO utils: process the completed I/O requests
+   If I/O requests are canceled or incomplete, resubmit the request.
+   Otherwise, a successful read launches the corresponding write, 
+   while a successful write results in an available entry in AIO
+   queue and an availble AIO buffer. 
+   write_comp indicates a completed write. */
+int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
+{
+  int ret;
+  struct aio_data *data = io_uring_cqe_get_data(cqe);
+
+  if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != aio_buf[data->buf_index].iov_len))
+  {
+    aio_prep_rw(data);
+    io_uring_cqe_seen(&aio_ring, cqe);
+    
+    ret = io_uring_submit(&aio_ring);
+    if (ret < 0) 
+    {
+      if (data->is_read)
+        fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", data->src_name, strerror(-ret));
+      else
+        fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", data->dst_name, strerror(-ret));  
+      aio_exit(true);
     }
-    // write(2, "r", 1);
+  }
+  else if (cqe->res < 0) 
+  {
+    ret = cqe->res;
+    io_uring_cqe_seen(&aio_ring, cqe);
+    
+    if (data->is_read)
+      fprintf(stderr, "error reading %s: %s\n", data->src_name, strerror(-ret));
+    else
+      fprintf(stderr, "error writing %s: %s\n", data->dst_name, strerror(-ret)); 
+    aio_wait_all_comp();
+    aio_free_data(data);
+    return -1;
+  } 
+  else if (data->is_read)
+  {
+    data->is_read = false;
+    aio_prep_rw(data);
+    io_uring_cqe_seen(&aio_ring, cqe);
+    
+    ret = io_uring_submit(&aio_ring);
+    if (ret < 0) 
+    {
+      fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", data->dst_name, strerror(-ret));
+      aio_exit(true);
+    }
+  }
+  else 
+  {
+    io_uring_cqe_seen(&aio_ring, cqe);
+    // if cnt is reduced to 0, close file
+    aio_free_data(data);
+    if (write_comp) *write_comp = true;
+  }
+
+  return 0;
+}
+
+/* AIO utils: wait for all inflight requests to complete
+   It returns -1 if any completed request gives an error, but does not
+   return immediately when error of a request occurs. */
+int aio_wait_all_comp()
+{
+  int final_ret = 0;
+  struct io_uring_cqe *cqe;
+  while (inflight > 0)
+  {
+      int ret = io_uring_wait_cqe(&aio_ring, &cqe);
+      if (ret < 0) 
+      {
+          fprintf(stderr, "Error in io_uring_wait_cqe or io_uring_peek_cqe: %s\n", strerror(-ret));
+          return 1;
+      }
+      if (aio_proc_cqe(cqe, NULL) < 0) final_ret = -1;
+  }
+  return final_ret;
 }
 
 /* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
@@ -327,190 +465,94 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
   *last_write_made_hole = false;
   *total_n_read = 0;
   bool make_hole = false;
-  off_t psize = 0;
+  off_t offset = start_offset;
+  int ret;
 
-  // AIO
-  static int busy = 0;          // # of I/O's in flight
-  static int tocopy = 0;        // # of blocks left to copy
-  struct stat sb;
-  struct stat src_open_sb;
-  io_context_t aio_ctx;
-  off_t length = 0, offset = start_offset;
-
-
-  
-  if (fstat (src_fd, &src_open_sb) != 0)
+  while (max_n_read) 
   {
-      error (0, errno, _("cannot fstat %s"), quoteaf (src_name));
-      return false;
-  }
-  length = MIN(src_open_sb.st_size, max_n_read);
-  memset(&aio_ctx, 0, sizeof(aio_ctx));
-  if (io_queue_init(AIO_MAXIO, &aio_ctx) != 0) {
-    error (0, errno, _("cannot aio_queue_init %s"), quoteaf (src_name));
-    return false;
-  }
+    bool need_submit = false; 
 
-  tocopy = length / AIO_BLKSIZE;
-  if (length % AIO_BLKSIZE > 0) tocopy++;
-  while (tocopy > 0) {
-    printf("aio cp get called!\n");
-    int i, rc, remaining;
-    remaining = (length - offset) / AIO_BLKSIZE;
-    if ((length - offset) % AIO_BLKSIZE > 0) remaining++;
-    int n = MIN(AIO_MAXIO - busy, remaining);
-    if (n > 0) {
-      struct iocb *ioq[n];
-      for (i = 0; i < n; i++) {
-        struct iocb *io = (struct iocb *) malloc(sizeof(struct iocb));
-        char *aio_buffer = NULL;
-	      posix_memalign((void **)&aio_buffer, 512, AIO_BLKSIZE);
-        if (NULL == aio_buffer || NULL == io) {
-          fprintf(stderr, "out of memory\n");
+    // prepare as many reads as possible
+    while (max_n_read && inflight < QD) 
+    {
+      off_t io_size = (max_n_read < AIO_BLKSIZE) ? max_n_read : AIO_BLKSIZE;
+
+      struct aio_data *data = NULL;
+      data = (struct aio_data *)malloc(sizeof(struct aio_data));
+      if (data == NULL) 
+      {
+        fprintf(stderr, "error allocating aio_data when reading %s\n", src_name);
+        aio_wait_all_comp();
+        return false;
+      }
+
+      data->src_fd = src_fd;
+      data->dst_fd = dest_fd;
+      data->offset = offset;
+      data->buf_index = aio_buf_dequeue();
+      if (data->buf_index < 0)
+      {
+        fprintf(stderr, "error getting buffer from aio_buf_queue when reading %s\n", src_name);
+        aio_exit(true);
+      }
+      aio_buf[data->buf_index].iov_len = io_size;
+      data->is_read = true;
+      data->src_name = src_name;
+      data->dst_name = dst_name;
+
+      aio_prep_rw(data);
+
+      offset += io_size;
+      max_n_read -= io_size;
+      *total_n_read += io_size;
+      inflight++;
+      need_submit = true;
+    }
+
+    // submit prepared I/O requests
+    if (need_submit)
+    {
+      ret = io_uring_submit(&aio_ring);
+      if (ret < 0)
+      {
+        fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", src_name, strerror(-ret));
+        aio_exit(true);
+      }
+    }
+
+    // process events from completed requests
+    if (inflight >= QD) 
+    {
+      struct io_uring_cqe *cqe;
+      struct aio_data *data;
+      bool write_comp = false;
+      while (1)
+      {
+        if (write_comp) // use unblocked wait to get more available events
+        {
+          ret = io_uring_peek_cqe(&aio_ring, &cqe);
+          if (ret == -EAGAIN) break;  // break the loop if no available events
+        }
+        else // use blocked wait to get at least one event
+          ret = io_uring_wait_cqe(&aio_ring, &cqe);
+        
+        if (ret < 0) 
+        {
+          fprintf(stderr, "error getting completed I/O requests: %s\n", strerror(-ret));
+          aio_exit(true);
+        }
+
+        if (aio_proc_cqe(cqe, &write_comp) < 0) 
+        {
+          aio_wait_all_comp();
           return false;
         }
-        int io_size = MIN(length - offset, AIO_BLKSIZE);
-        io_prep_pread(io, src_fd, aio_buffer, io_size, offset);
-        io->data = (void*)rd_done;
-        //io_set_callback(io, rd_done);
-        ioq[i] = io;
-        offset += io_size;
-      }
-
-      rc = io_submit(aio_ctx, n, ioq);
-      if (rc < 0) {
-        fprintf(stderr, "io_submit error!\n");
-        return false;
-      }
-      busy += n;
-    }
-
-    //customized aio run
-    static struct timespec timeout = { 0, 0 };
-    struct io_event event;
-    int io_q_run_r;
-    while (1 == (io_q_run_r = io_getevents(aio_ctx, 0, 1, &event, &timeout))) {
-        // io_callback_t cb = (io_callback_t)event.data;
-        struct iocb *iocb = event.obj;
-        aio_cb_t cb = (aio_cb_t)iocb->data;
-
-        cb(aio_ctx, iocb, event.res, event.res2, dest_fd);
-        if (iocb->aio_lio_opcode == IO_CMD_PWRITE) {
-          --tocopy;
-          --busy;
-          *total_n_read += event.res;
-        }
-    }
-    if (io_q_run_r < 0) {
-      fprintf(stderr, "io_queue_run error\n");
-      return false;
-    }
-
-    // customized aio q wait
-    if (busy == AIO_MAXIO) {
-      rc = io_getevents(aio_ctx, 0, 0, NULL, NULL);
-      if (rc < 0) {
-        fprintf(stderr, "io_get_event_waiting_for_at_least_one error\n");
-        return false;
       }
     }
   }
 
-
-
-  // while (max_n_read)
-  //   {
-  //     ssize_t n_read = read (src_fd, buf, MIN (max_n_read, buf_size));
-  //     if (n_read < 0)
-  //       {
-  //         if (errno == EINTR)
-  //           continue;
-  //         error (0, errno, _("error reading %s"), quoteaf (src_name));
-  //         return false;
-  //       }
-  //     if (n_read == 0)
-  //       break;
-  //     max_n_read -= n_read;
-  //     *total_n_read += n_read;
-
-  //     /* Loop over the input buffer in chunks of hole_size.  */
-  //     size_t csize = hole_size ? hole_size : buf_size;
-  //     char *cbuf = buf;
-  //     char *pbuf = buf;
-
-  //     while (n_read)
-  //       {
-  //         bool prev_hole = make_hole;
-  //         csize = MIN (csize, n_read);
-
-  //         if (hole_size && csize)
-  //           make_hole = is_nul (cbuf, csize);
-
-  //         bool transition = (make_hole != prev_hole) && psize;
-  //         bool last_chunk = (n_read == csize && ! make_hole) || ! csize;
-
-  //         if (transition || last_chunk)
-  //           {
-  //             if (! transition)
-  //               psize += csize;
-
-  //             if (! prev_hole)
-  //               {
-  //                 if (full_write (dest_fd, pbuf, psize) != psize)
-  //                   {
-  //                     error (0, errno, _("error writing %s"),
-  //                            quoteaf (dst_name));
-  //                     return false;
-  //                   }
-  //               }
-  //             else
-  //               {
-  //                 if (! create_hole (dest_fd, dst_name, punch_holes, psize))
-  //                   return false;
-  //               }
-
-  //             pbuf = cbuf;
-  //             psize = csize;
-
-  //             if (last_chunk)
-  //               {
-  //                 if (! csize)
-  //                   n_read = 0; /* Finished processing buffer.  */
-
-  //                 if (transition)
-  //                   csize = 0;  /* Loop again to deal with last chunk.  */
-  //                 else
-  //                   psize = 0;  /* Reset for next read loop.  */
-  //               }
-  //           }
-  //         else  /* Coalesce writes/seeks.  */
-  //           {
-  //             if (INT_ADD_WRAPV (psize, csize, &psize))
-  //               {
-  //                 error (0, 0, _("overflow reading %s"), quoteaf (src_name));
-  //                 return false;
-  //               }
-  //           }
-
-  //         n_read -= csize;
-  //         cbuf += csize;
-  //       }
-
-  //     *last_write_made_hole = make_hole;
-
-  //     /* It's tempting to break early here upon a short read from
-  //        a regular file.  That would save the final read syscall
-  //        for each file.  Unfortunately that doesn't work for
-  //        certain files in /proc or /sys with linux kernels.  */
-  //   }
-
-  // /* Ensure a trailing hole is created, so that subsequent
-  //    calls of sparse_copy() start at the correct offset.  */
-  // if (make_hole && ! create_hole (dest_fd, dst_name, punch_holes, psize))
-  //   return false;
-  // else
-  //   return true;
-  return true;
+  if (aio_wait_all_comp() < 0) return false;
+  else return true;
 }
 
 /* Perform the O(1) btrfs clone operation, if possible.
@@ -1490,7 +1532,7 @@ copy_reg (char const *src_name, char const *dst_name,
       if (! sparse_copy (source_desc, dest_desc, buf, buf_size,
                          make_holes ? hole_size : 0,
                          x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
-                         UINTMAX_MAX, &n_read,
+                         src_open_sb.st_size, &n_read,
                          0,
                          &wrote_hole_at_eof))
         {
@@ -3169,7 +3211,27 @@ copy (char const *src_name, char const *dst_name,
       bool *copy_into_self, bool *rename_succeeded)
 {
   assert (valid_options (options));
-  fprintf(stderr, "DEBUGGGGGG, copy main function get called.\n"); 
+
+  // initialize AIO buffer queue
+  int ret = io_uring_queue_init(QD, &aio_ring, 0);
+  if (ret < 0) 
+  {
+    fprintf(stderr, "error initializing io_uring: %s\n", strerror(-ret));
+    return false;
+  }
+
+  // initialize AIO buffer queue
+  ret = aio_buf_queue_init();
+  if (ret < 0) return false;
+
+  // register AIO buffer
+  ret = io_uring_register_buffers(&aio_ring, aio_buf, QD);
+  if (ret < 0)
+  {
+    fprintf(stderr, "Fail to register buffer: %s\n", strerror(-ret));
+    aio_exit(false);
+    return false;
+  }
 
   /* Record the file names: they're used in case of error, when copying
      a directory into itself.  I don't like to make these tools do *any*
@@ -3182,10 +3244,13 @@ copy (char const *src_name, char const *dst_name,
   top_level_dst_name = dst_name;
 
   bool first_dir_created_per_command_line_arg = false;
-  return copy_internal (src_name, dst_name, nonexistent_dst, NULL, NULL,
-                        options, true,
-                        &first_dir_created_per_command_line_arg,
-                        copy_into_self, rename_succeeded);
+  bool ok = copy_internal (src_name, dst_name, nonexistent_dst, NULL, NULL,
+                          options, true,
+                          &first_dir_created_per_command_line_arg,
+                          copy_into_self, rename_succeeded);
+
+  aio_exit(false);
+  return ok;
 }
 
 /* Set *X to the default options for a value of type struct cp_options.  */
