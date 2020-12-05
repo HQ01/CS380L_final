@@ -209,8 +209,9 @@ int aio_buf_dequeue()
 void aio_exit(bool fatal_error);
 void aio_free_data(struct aio_data *data);
 void aio_prep_rw(struct aio_data *data);
-int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp);
-int aio_wait_all_comp();
+void aio_submit(int ready, char const *file_name, bool is_read);
+bool aio_proc_cqe(struct io_uring_cqe *cqe, off_t *total_n_read, bool *write_comp, bool io_error);
+bool aio_wait_all_comp(off_t *total_n_read, bool io_error);
 
 
 static bool copy_internal (char const *src_name, char const *dst_name,
@@ -341,51 +342,85 @@ void aio_exit(bool fatal_error)
 void aio_free_data(struct aio_data *data)
 {
   if (aio_buf_enqueue(data->buf_index) < 0) 
-    {
-      fprintf(stderr, "error releasing buffer back to AIO buffer queue\n");
-      aio_exit(true);
-    } 
+  {
+    fprintf(stderr, "error releasing buffer back to AIO buffer queue\n");
+    aio_exit(true);
+  } 
   free(data);
-  inflight--;
 }
 
 /* AIO utils: prepare for read/write */
 void aio_prep_rw(struct aio_data *data) 
 {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
-    if (data->is_read)
-        io_uring_prep_readv(sqe, data->src_fd, &aio_buf[data->buf_index], 1, data->offset);
-    else 
-        io_uring_prep_writev(sqe, data->dst_fd, &aio_buf[data->buf_index], 1, data->offset);
-    io_uring_sqe_set_data(sqe, data);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
+  if (data->is_read)
+      io_uring_prep_readv(sqe, data->src_fd, &aio_buf[data->buf_index], 1, data->offset);
+  else 
+      io_uring_prep_writev(sqe, data->dst_fd, &aio_buf[data->buf_index], 1, data->offset);
+  io_uring_sqe_set_data(sqe, data);
+
+  // if (data->is_read)
+  //   fprintf(stderr, "reading %s at offset %ld with length %ld using buffer with index %d\n", 
+  //           data->src_name, data->offset, aio_buf[data->buf_index].iov_len, data->buf_index);
+  // else
+  //   fprintf(stderr, "writing %s at offset %ld with length %ld using buffer with index %d\n", 
+  //           data->dst_name, data->offset, aio_buf[data->buf_index].iov_len, data->buf_index);
 }
 
-/* AIO utils: process the completed I/O requests
-   If I/O requests are canceled or incomplete, resubmit the request.
-   Otherwise, a successful read launches the corresponding write, 
-   while a successful write results in an available entry in AIO
-   queue and an availble AIO buffer. 
-   write_comp indicates a completed write. */
-int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
+/* AIO utils: submit prepared I/O requests */
+void aio_submit(int ready, char const *file_name, bool is_read)
+{
+  int ret;
+  while (ready) 
+  {
+    ret = io_uring_submit(&aio_ring);
+    // fprintf(stderr, "ready: %d; ret: %d\n", ready, ret);
+
+    if (ret < 0) 
+    {
+      if (is_read)
+        fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", file_name, strerror(-ret));
+      else
+        fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", file_name, strerror(-ret));  
+      aio_exit(true);
+    }
+    else if (ret == 0)
+    {
+      if (is_read)
+        fprintf(stderr, "error submitting I/O requests when reading %s: no submission\n", file_name);
+      else
+        fprintf(stderr, "error submitting I/O requests when writing %s: no submission\n", file_name);  
+      aio_exit(true);
+    }
+
+    ready -= ret;
+    inflight += ret;
+  }
+}
+
+/* AIO utils: process the completed I/O requests */
+bool aio_proc_cqe(struct io_uring_cqe *cqe, off_t *total_n_read, bool *write_comp, bool io_error)
 {
   int ret;
   struct aio_data *data = io_uring_cqe_get_data(cqe);
+  inflight--;
 
+  // do not process the completed request if an I/O error has occured
+  if (io_error)
+  {
+    io_uring_cqe_seen(&aio_ring, cqe);
+    aio_free_data(data);
+    return false;
+  }
+
+  // resubmit the request if I/O request is canceled or incomplete
   if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != aio_buf[data->buf_index].iov_len))
   {
     aio_prep_rw(data);
     io_uring_cqe_seen(&aio_ring, cqe);
-    
-    ret = io_uring_submit(&aio_ring);
-    if (ret < 0) 
-    {
-      if (data->is_read)
-        fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", data->src_name, strerror(-ret));
-      else
-        fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", data->dst_name, strerror(-ret));  
-      aio_exit(true);
-    }
+    aio_submit(1, data->is_read ? data->src_name : data->dst_name, data->is_read);
   }
+  // I/O error
   else if (cqe->res < 0) 
   {
     ret = cqe->res;
@@ -395,23 +430,19 @@ int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
       fprintf(stderr, "error reading %s: %s\n", data->src_name, strerror(-ret));
     else
       fprintf(stderr, "error writing %s: %s\n", data->dst_name, strerror(-ret)); 
-    aio_wait_all_comp();
     aio_free_data(data);
-    return -1;
+    return false;
   } 
+  // a successful read launches the corresponding write
   else if (data->is_read)
   {
+    *total_n_read += aio_buf[data->buf_index].iov_len;
     data->is_read = false;
     aio_prep_rw(data);
     io_uring_cqe_seen(&aio_ring, cqe);
-    
-    ret = io_uring_submit(&aio_ring);
-    if (ret < 0) 
-    {
-      fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", data->dst_name, strerror(-ret));
-      aio_exit(true);
-    }
+    aio_submit(1, data->dst_name, false);
   }
+  // a successful write results in an available entry in AIO queue and an availble AIO buffer
   else 
   {
     io_uring_cqe_seen(&aio_ring, cqe);
@@ -420,27 +451,27 @@ int aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
     if (write_comp) *write_comp = true;
   }
 
-  return 0;
+  return true;
 }
 
 /* AIO utils: wait for all inflight requests to complete
-   It returns -1 if any completed request gives an error, but does not
+   It returns false if any completed request gives an error, but does not
    return immediately when error of a request occurs. */
-int aio_wait_all_comp()
+bool aio_wait_all_comp(off_t *total_n_read, bool io_error)
 {
-  int final_ret = 0;
   struct io_uring_cqe *cqe;
   while (inflight > 0)
   {
+      // fprintf(stderr, "inflight: %d\n", inflight);
       int ret = io_uring_wait_cqe(&aio_ring, &cqe);
       if (ret < 0) 
       {
-          fprintf(stderr, "Error in io_uring_wait_cqe or io_uring_peek_cqe: %s\n", strerror(-ret));
-          return 1;
+          fprintf(stderr, "error getting completed I/O requests: %s\n", strerror(-ret));
+          aio_exit(true);
       }
-      if (aio_proc_cqe(cqe, NULL) < 0) final_ret = -1;
+      io_error |= !aio_proc_cqe(cqe, total_n_read, NULL, io_error);
   }
-  return final_ret;
+  return !io_error;
 }
 
 /* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
@@ -470,10 +501,10 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
 
   while (max_n_read) 
   {
-    bool need_submit = false; 
+    int ready = 0;
 
     // prepare as many reads as possible
-    while (max_n_read && inflight < QD) 
+    while (max_n_read && inflight + ready < QD) 
     {
       off_t io_size = (max_n_read < AIO_BLKSIZE) ? max_n_read : AIO_BLKSIZE;
 
@@ -482,7 +513,8 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
       if (data == NULL) 
       {
         fprintf(stderr, "error allocating aio_data when reading %s\n", src_name);
-        aio_wait_all_comp();
+        if (ready) aio_submit(ready, src_name, true);
+        aio_wait_all_comp(total_n_read, true);
         return false;
       }
 
@@ -504,21 +536,11 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
 
       offset += io_size;
       max_n_read -= io_size;
-      *total_n_read += io_size;
-      inflight++;
-      need_submit = true;
+      ready++;
     }
 
     // submit prepared I/O requests
-    if (need_submit)
-    {
-      ret = io_uring_submit(&aio_ring);
-      if (ret < 0)
-      {
-        fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", src_name, strerror(-ret));
-        aio_exit(true);
-      }
-    }
+    if (ready) aio_submit(ready, src_name, true);
 
     // process events from completed requests
     if (inflight >= QD) 
@@ -542,17 +564,17 @@ sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
           aio_exit(true);
         }
 
-        if (aio_proc_cqe(cqe, &write_comp) < 0) 
-        {
-          aio_wait_all_comp();
-          return false;
-        }
+        if (!aio_proc_cqe(cqe, total_n_read, &write_comp, false)) return aio_wait_all_comp(total_n_read, true);
       }
     }
   }
+  // fprintf(stderr, "All reads are submitted\n");
 
-  if (aio_wait_all_comp() < 0) return false;
-  else return true;
+  // bool ok = aio_wait_all_comp(total_n_read, false);
+  // fprintf(stderr, "%s: all requests are done\n", ok ? "Success" : "Failure");
+  // fprintf(stderr, "queue head: %d; queue tail: %d\n", aio_buf_qhead, aio_buf_qtail);
+  // return ok;
+  return aio_wait_all_comp(total_n_read, false);
 }
 
 /* Perform the O(1) btrfs clone operation, if possible.
@@ -1259,7 +1281,7 @@ copy_reg (char const *src_name, char const *dst_name,
   bool data_copy_required = x->data_copy_required;
 
   source_desc = open (src_name,
-                      (O_RDONLY | O_BINARY | O_DIRECT
+                      (O_RDONLY | O_BINARY
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
   if (source_desc < 0)
     {
@@ -1290,7 +1312,7 @@ copy_reg (char const *src_name, char const *dst_name,
   if (! *new_dst)
     {
       int open_flags =
-        O_WRONLY | O_BINARY | O_DIRECT | (x->data_copy_required ? O_TRUNC : 0);
+        O_WRONLY | O_BINARY | (x->data_copy_required ? O_TRUNC : 0);
       dest_desc = open (dst_name, open_flags);
       dest_errno = errno;
 
@@ -1347,7 +1369,7 @@ copy_reg (char const *src_name, char const *dst_name,
     {
     open_with_O_CREAT:;
 
-      int open_flags = O_WRONLY | O_CREAT | O_BINARY | O_DIRECT;
+      int open_flags = O_WRONLY | O_CREAT | O_BINARY;
       dest_desc = open (dst_name, open_flags | O_EXCL,
                         dst_mode & ~omitted_permissions);
       dest_errno = errno;
@@ -1420,12 +1442,12 @@ copy_reg (char const *src_name, char const *dst_name,
       goto close_src_desc;
     }
 
-  if (ftruncate(dest_desc, src_open_sb.st_size) != 0)
-      {
-        error (0, errno, _("cannot ftruncate %s"), quoteaf (dst_name));
-        return_val = false;
-        goto close_src_and_dst_desc;
-      }
+  // if (ftruncate(dest_desc, src_open_sb.st_size) != 0)
+  //   {
+  //     error (0, errno, _("cannot ftruncate %s"), quoteaf (dst_name));
+  //     return_val = false;
+  //     goto close_src_and_dst_desc;
+  //   }
 
   if (fstat (dest_desc, &sb) != 0)
     {
