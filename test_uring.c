@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
@@ -16,9 +17,8 @@
 struct aio_data {
     int src_fd;
     int dst_fd;
-    off_t size;
     off_t offset;
-    struct iovec iov;
+    int buf_index;
     bool is_read;
     // int *cnt;
 };
@@ -26,19 +26,81 @@ struct aio_data {
 struct io_uring aio_ring;
 int inflight = 0;
 
+/* aio buffer queue */
+int aio_buf_queue[QD];
+struct iovec aio_buf[QD];
+int aio_buf_qhead, aio_buf_qtail;
+
+int aio_buf_queue_init() {
+    aio_buf_qhead = 0;
+    aio_buf_qtail = QD - 1;
+    for (int i = 0; i < QD; i++) 
+    {
+        // allocate aio buffer
+        aio_buf[i].iov_base = NULL;
+        aio_buf[i].iov_base = malloc(AIO_BLKSIZE);
+        if (aio_buf[i].iov_base == NULL)
+        {
+            fprintf(stderr, "Error in allocating aio buffer\n");
+            return -1;
+        }
+        aio_buf[i].iov_len = AIO_BLKSIZE;
+        memset(aio_buf[i].iov_base, 0, AIO_BLKSIZE);
+
+        // initialize buffer queue
+        aio_buf_queue[i] = i;
+    }
+    return 0;
+}
+
+void aio_buf_queue_destroy()
+{
+    for (int i = 0; i < QD; i++)
+        free(aio_buf[i].iov_base);
+}
+
+int aio_buf_enqueue(int buf_index) 
+{
+    int tmp = aio_buf_qtail;
+    aio_buf_qtail = (aio_buf_qtail + 1) % QD;
+    if (aio_buf_queue[aio_buf_qtail] >= 0) 
+    {
+        aio_buf_qtail = tmp;
+        fprintf(stderr, "Queue is full\n");
+        return -1;
+    }
+    aio_buf_queue[aio_buf_qtail] = buf_index;
+    return 0;
+}
+
+int aio_buf_dequeue() 
+{
+    if (aio_buf_queue[aio_buf_qhead] == -1) 
+    {
+        fprintf(stderr, "Queue is empty\n");
+        return -1;
+    }
+    int buf_index = aio_buf_queue[aio_buf_qhead];
+    aio_buf_queue[aio_buf_qhead] = -1;
+    aio_buf_qhead = (aio_buf_qhead + 1) % QD;
+    return buf_index;
+}
+
+/* aio buffer queue */
+
 void aio_prep_rw(struct aio_data *data) 
 {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(aio_ring);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
     if (data->is_read)
-        io_uring_prep_readv(sqe, data->src_fd, &data->iov, 1, data->offset);
+        io_uring_prep_readv(sqe, data->src_fd, &aio_buf[data->buf_index], 1, data->offset);
     else 
-        io_uring_prep_writev(sqe, data->dst_fd, &data->iov, 1, data->offset);
+        io_uring_prep_writev(sqe, data->dst_fd, &aio_buf[data->buf_index], 1, data->offset);
     io_uring_sqe_set_data(sqe, data);
 }
 
 void aio_submit()
 {
-    int ret = io_uring_submit(aio_ring);
+    int ret = io_uring_submit(&aio_ring);
     if (ret < 0)
     {
         fprintf(stderr, "Error in submitting aio requests: %s\n", strerror(-ret));
@@ -46,15 +108,15 @@ void aio_submit()
     }
 }
 
-void aio_proc_ret(struct io_uring_cqe *cqe)
+bool aio_proc_ret(struct io_uring_cqe *cqe)
 {
     struct aio_data *data = io_uring_cqe_get_data(cqe);
-    if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != data->size))
+    if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != aio_buf[data->buf_index].iov_len))
     {
         aio_prep_rw(data);
-        ret = io_uring_submit(aio_ring);
         aio_submit();
-        io_uring_cqe_seen(aio_ring, cqe);
+        io_uring_cqe_seen(&aio_ring, cqe);
+        return false;
     }
     else if (cqe->res < 0) 
     {
@@ -66,22 +128,34 @@ void aio_proc_ret(struct io_uring_cqe *cqe)
         data->is_read = false;
         aio_prep_rw(data);
         aio_submit();
+        io_uring_cqe_seen(&aio_ring, cqe);
+        return false;
     }
     else 
     {
-        free(data->iov.iov_base);
+        aio_buf_enqueue(data->buf_index);
         free(data);
         inflight--;
+        io_uring_cqe_seen(&aio_ring, cqe);
+        return true;
     }
-    io_uring_cqe_seen(aio_ring, cqe);
 }
 
 int main(int argc, char *argv[]) 
 {
-    int ret = o_uring_queue_init(QD, &aio_ring, 0);
+    // global
+    int ret = io_uring_queue_init(QD, &aio_ring, 0);
     if (ret < 0) 
     {
         fprintf(stderr, "Error in setup io_uring: %s\n", strerror(-ret));
+        return 1;
+    }
+    ret = aio_buf_queue_init();
+    if (ret < 0) return 1;
+    ret = io_uring_register_buffers(&aio_ring, aio_buf, QD);
+    if (ret < 0)
+    {
+        fprintf(stderr, "Error in registering buffer: %s\n", strerror(-ret));
         return 1;
     }
 
@@ -102,25 +176,36 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    dst_fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dst_fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (dst_fd < 0) {
+        close(src_fd);
         perror("open outfile");
         return 1;
     }
 
-    if (fstat(srcfd, &st) < 0)
+    if (fstat(src_fd, &st) < 0)
     {
+        close(src_fd);
+        close(dst_fd);
         perror("fstat");
         exit(1);
     }
     max_n_read = st.st_size;
 
+    if (fallocate(dst_fd, 0, 0, max_n_read) < 0) {
+        close(src_fd);
+        close(dst_fd);
+        perror("fllocate");
+        exit(1);
+    }
+    // fprintf(stderr, "max_n_read: %ld\n", max_n_read);
+
     // sparse copy start
     off_t offset = 0;
-    int ret;
 
     while (offset < max_n_read) 
     {
+        // fprintf(stderr, "\n offset %ld:", offset);
         bool need_submit = false; 
         while (offset < max_n_read && inflight < QD) 
         {
@@ -133,21 +218,22 @@ int main(int argc, char *argv[])
             }
             data->src_fd = src_fd;
             data->dst_fd = dst_fd;
-            data->size = (max_n_read - offset < AIO_BLKSIZE) ? max_n_read - offset : AIO_BLKSIZE;
             data->offset = offset;
-            data->iov.iov_base = NULL;
-            data->iov.iov_base = malloc(AIO_BLKSIZE);
-            if (data->iov.iov_base == NULL) 
-            {
-                fprintf(stderr, "Error in allocating buffer\n");
-                return 1;
-            }
-            data->iov.iov_len = AIO_BLKSIZE;
+            // data->iov.iov_base = NULL;
+            // data->iov.iov_base = malloc(AIO_BLKSIZE);
+            // if (data->iov.iov_base == NULL) 
+            // {
+            //     fprintf(stderr, "Error in allocating buffer\n");
+            //     return 1;
+            // }
+            data->buf_index = aio_buf_dequeue();
+            if (data->buf_index == -1) return 1;
+            aio_buf[data->buf_index].iov_len = (max_n_read - offset < AIO_BLKSIZE) ? max_n_read - offset : AIO_BLKSIZE;
             data->is_read = true;
 
             aio_prep_rw(data);
 
-            offset += data->size;
+            offset += aio_buf[data->buf_index].iov_len;
             inflight++;
             need_submit = true;
         }
@@ -166,12 +252,12 @@ int main(int argc, char *argv[])
             {
                 if (write_comp) // use unblocked wait to get more available events
                 {
-                    ret = io_uring_peek_cqe(aio_ring, &cqe);
+                    ret = io_uring_peek_cqe(&aio_ring, &cqe);
                     if (ret == -EAGAIN) break;  // break the loop if no available events
                 }
                 else // use blocked wait to get at least one event
                 {
-                    ret = io_uring_wait_cqe(aio_ring, &cqe);
+                    ret = io_uring_wait_cqe(&aio_ring, &cqe);
                 }
                 
                 if (ret < 0) 
@@ -180,22 +266,23 @@ int main(int argc, char *argv[])
                     return 1;
                 }
 
-                aio_proc_ret(cqe);
+                write_comp = aio_proc_ret(cqe);
             }
         }
     }
+    fprintf(stderr, "all read submitted\n");
 
     // wait for all requests to complete
     struct io_uring_cqe *cqe;
     while (inflight > 0)
     {
-        ret = io_uring_wait_cqe(aio_ring, &cqe);
+        ret = io_uring_wait_cqe(&aio_ring, &cqe);
         if (ret < 0) 
         {
             fprintf(stderr, "Error in io_uring_wait_cqe or io_uring_peek_cqe: %s\n", strerror(-ret));
             return 1;
         }
-        aio_proc_ret(cqe);
+        bool write_comp = aio_proc_ret(cqe);
     }
 
 
@@ -204,6 +291,8 @@ int main(int argc, char *argv[])
 
     // global
     io_uring_queue_exit(&aio_ring);
+    aio_buf_queue_destroy();
+    fprintf(stderr, "\ndone\n");
 
     return 0;
 }
