@@ -37,7 +37,7 @@
 #include "backupfile.h"
 #include "buffer-lcm.h"
 #include "canonicalize.h"
-#include "copy.h"
+#include "copy_uring.h"
 #include "cp-hash.h"
 #include "extent-scan.h"
 #include "die.h"
