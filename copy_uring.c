@@ -486,7 +486,7 @@ bool aio_wait_all_comp(off_t *total_n_read, bool io_error)
    DEST_FD introduced a hole.  Set *TOTAL_N_READ to the number of
    bytes read.  */
 static bool
-sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
+sparse_copy (int src_fd, int dest_fd,
              size_t hole_size, bool punch_holes,
              char const *src_name, char const *dst_name,
              uintmax_t max_n_read, off_t *total_n_read,
@@ -633,7 +633,7 @@ write_zeros (int fd, off_t n_bytes)
    Upon any other failure, set *NORMAL_COPY_REQUIRED to false and
    return false.  */
 static bool
-extent_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
+extent_copy (int src_fd, int dest_fd,
              size_t hole_size, off_t src_total_size,
              enum Sparse_type sparse_mode,
              char const *src_name, char const *dst_name,
@@ -768,7 +768,7 @@ extent_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
               last_ext_len = ext_len;
               bool read_hole;
 
-              if ( ! sparse_copy (src_fd, dest_fd, buf, buf_size,
+              if ( ! sparse_copy (src_fd, dest_fd,
                                   sparse_mode == SPARSE_ALWAYS ? hole_size: 0,
                                   true, src_name, dst_name, ext_len, &n_read,
                                   dest_pos,
@@ -1268,8 +1268,8 @@ copy_reg (char const *src_name, char const *dst_name,
           mode_t dst_mode, mode_t omitted_permissions, bool *new_dst,
           struct stat const *src_sb)
 {
-  char *buf;
-  char *buf_alloc = NULL;
+  // char *buf;
+  // char *buf_alloc = NULL;
   char *name_alloc = NULL;
   int dest_desc;
   int dest_errno;
@@ -1476,8 +1476,8 @@ copy_reg (char const *src_name, char const *dst_name,
   if (data_copy_required)
     {
       /* Choose a suitable buffer size; it may be adjusted later.  */
-      size_t buf_alignment = getpagesize ();
-      size_t buf_size = io_blksize (sb);
+      // size_t buf_alignment = getpagesize ();
+      // size_t buf_size = io_blksize (sb);
       size_t hole_size = ST_BLKSIZE (sb);
 
       fdadvise (source_desc, 0, 0, FADVISE_SEQUENTIAL);
@@ -1501,32 +1501,32 @@ copy_reg (char const *src_name, char const *dst_name,
             make_holes = true;
         }
 
-      /* If not making a sparse file, try to use a more-efficient
-         buffer size.  */
-      if (! make_holes)
-        {
-          /* Compute the least common multiple of the input and output
-             buffer sizes, adjusting for outlandish values.  */
-          size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
-          size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
-                                    blcm_max);
+      // /* If not making a sparse file, try to use a more-efficient
+      //    buffer size.  */
+      // if (! make_holes)
+      //   {
+      //     /* Compute the least common multiple of the input and output
+      //        buffer sizes, adjusting for outlandish values.  */
+      //     size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment;
+      //     size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
+      //                               blcm_max);
 
-          /* Do not bother with a buffer larger than the input file, plus one
-             byte to make sure the file has not grown while reading it.  */
-          if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
-            buf_size = src_open_sb.st_size + 1;
+      //     /* Do not bother with a buffer larger than the input file, plus one
+      //        byte to make sure the file has not grown while reading it.  */
+      //     if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
+      //       buf_size = src_open_sb.st_size + 1;
 
-          /* However, stick with a block size that is a positive multiple of
-             blcm, overriding the above adjustments.  Watch out for
-             overflow.  */
-          buf_size += blcm - 1;
-          buf_size -= buf_size % blcm;
-          if (buf_size == 0 || blcm_max < buf_size)
-            buf_size = blcm;
-        }
+      //     /* However, stick with a block size that is a positive multiple of
+      //        blcm, overriding the above adjustments.  Watch out for
+      //        overflow.  */
+      //     buf_size += blcm - 1;
+      //     buf_size -= buf_size % blcm;
+      //     if (buf_size == 0 || blcm_max < buf_size)
+      //       buf_size = blcm;
+      //   }
 
-      buf_alloc = xmalloc (buf_size + buf_alignment);
-      buf = ptr_align (buf_alloc, buf_alignment);
+      // buf_alloc = xmalloc (buf_size + buf_alignment);
+      // buf = ptr_align (buf_alloc, buf_alignment);
 
       if (sparse_src)
         {
@@ -1536,7 +1536,7 @@ copy_reg (char const *src_name, char const *dst_name,
              standard copy only if the initial extent scan fails.  If the
              '--sparse=never' option is specified, write all data but use
              any extents to read more efficiently.  */
-          if (extent_copy (source_desc, dest_desc, buf, buf_size, hole_size,
+          if (extent_copy (source_desc, dest_desc, hole_size,
                            src_open_sb.st_size,
                            make_holes ? x->sparse_mode : SPARSE_NEVER,
                            src_name, dst_name, &normal_copy_required))
@@ -1551,7 +1551,7 @@ copy_reg (char const *src_name, char const *dst_name,
 
       off_t n_read;
       bool wrote_hole_at_eof;
-      if (! sparse_copy (source_desc, dest_desc, buf, buf_size,
+      if (! sparse_copy (source_desc, dest_desc,
                          make_holes ? hole_size : 0,
                          x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
                          src_open_sb.st_size, &n_read,
@@ -1668,7 +1668,7 @@ close_src_desc:
       return_val = false;
     }
 
-  free (buf_alloc);
+  // free (buf_alloc);
   free (name_alloc);
   return return_val;
 }
