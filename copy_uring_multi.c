@@ -135,8 +135,8 @@ struct dir_list
 #define DEST_INFO_INITIAL_CAPACITY 61
 
 /* AIO configurations */
-#define AIO_BLKSIZE (128 * 1024)    // I/O block size
-#define QD 64                       // I/O queue depth
+#define AIO_BLKSIZE (10 * 1024 * 1024)    // I/O block size
+#define QD 1024                       // I/O queue depth
 
 struct aio_data {
     int src_fd;
@@ -164,7 +164,7 @@ int aio_buf_qhead, aio_buf_qtail;
 int aio_buf_queue_init() {
     aio_buf_qhead = 0;
     aio_buf_qtail = QD - 1;
-    for (int i = 0; i < QD; i++) 
+    for (int i = 0; i < QD; i++)
     {
         // allocate AIO buffer
         aio_buf[i].iov_base = NULL;
@@ -190,11 +190,11 @@ void aio_buf_queue_destroy()
         free(aio_buf[i].iov_base);
 }
 
-int aio_buf_enqueue(int buf_index) 
+int aio_buf_enqueue(int buf_index)
 {
     int tmp = aio_buf_qtail;
     aio_buf_qtail = (aio_buf_qtail + 1) % QD;
-    if (aio_buf_queue[aio_buf_qtail] >= 0) 
+    if (aio_buf_queue[aio_buf_qtail] >= 0)
     {
         aio_buf_qtail = tmp;
         return -1;
@@ -203,7 +203,7 @@ int aio_buf_enqueue(int buf_index)
     return 0;
 }
 
-int aio_buf_dequeue() 
+int aio_buf_dequeue()
 {
     if (aio_buf_queue[aio_buf_qhead] < 0) return -1;
     int buf_index = aio_buf_queue[aio_buf_qhead];
@@ -348,7 +348,7 @@ void aio_exit(bool fatal_error)
 /* AIO utils: free AIO data and release buffer back to queue */
 void aio_free_data(struct aio_data *data)
 {
-  if (aio_buf_enqueue(data->buf_index) < 0) 
+  if (aio_buf_enqueue(data->buf_index) < 0)
   {
     fprintf(stderr, "error releasing buffer back to AIO buffer queue\n");
     aio_exit(true);
@@ -370,22 +370,22 @@ void aio_free_data(struct aio_data *data)
 }
 
 /* AIO utils: prepare for read/write */
-void aio_prep_rw(struct aio_data *data) 
+void aio_prep_rw(struct aio_data *data)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
   if (data->is_read)
-      io_uring_prep_read_fixed(sqe, data->src_fd, aio_buf[data->buf_index].iov_base, 
+      io_uring_prep_read_fixed(sqe, data->src_fd, aio_buf[data->buf_index].iov_base,
                                aio_buf[data->buf_index].iov_len, data->offset, data->buf_index);
-  else 
-      io_uring_prep_write_fixed(sqe, data->dst_fd, aio_buf[data->buf_index].iov_base, 
+  else
+      io_uring_prep_write_fixed(sqe, data->dst_fd, aio_buf[data->buf_index].iov_base,
                                 aio_buf[data->buf_index].iov_len, data->offset, data->buf_index);
   io_uring_sqe_set_data(sqe, data);
 
   // if (data->is_read)
-  //   fprintf(stderr, "reading %s at offset %ld with length %ld using buffer with index %d\n", 
+  //   fprintf(stderr, "reading %s at offset %ld with length %ld using buffer with index %d\n",
   //           data->src_name, data->offset, aio_buf[data->buf_index].iov_len, data->buf_index);
   // else
-  //   fprintf(stderr, "writing %s at offset %ld with length %ld using buffer with index %d\n", 
+  //   fprintf(stderr, "writing %s at offset %ld with length %ld using buffer with index %d\n",
   //           data->dst_name, data->offset, aio_buf[data->buf_index].iov_len, data->buf_index);
 }
 
@@ -393,17 +393,17 @@ void aio_prep_rw(struct aio_data *data)
 void aio_submit(int ready, int *cnt, char const *file_name, bool is_read)
 {
   int ret;
-  while (ready) 
+  while (ready)
   {
     ret = io_uring_submit(&aio_ring);
     // fprintf(stderr, "ready: %d; ret: %d\n", ready, ret);
 
-    if (ret < 0) 
+    if (ret < 0)
     {
       if (is_read)
         fprintf(stderr, "error submitting I/O requests when reading %s: %s\n", file_name, strerror(-ret));
       else
-        fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", file_name, strerror(-ret));  
+        fprintf(stderr, "error submitting I/O requests when writing %s: %s\n", file_name, strerror(-ret));
       aio_exit(true);
     }
     else if (ret == 0)
@@ -411,7 +411,7 @@ void aio_submit(int ready, int *cnt, char const *file_name, bool is_read)
       if (is_read)
         fprintf(stderr, "error submitting I/O requests when reading %s: no submission\n", file_name);
       else
-        fprintf(stderr, "error submitting I/O requests when writing %s: no submission\n", file_name);  
+        fprintf(stderr, "error submitting I/O requests when writing %s: no submission\n", file_name);
       aio_exit(true);
     }
 
@@ -444,19 +444,19 @@ void aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
     aio_submit(1, data->cnt, data->is_read ? data->src_name : data->dst_name, data->is_read);
   }
   // I/O error
-  else if (cqe->res < 0) 
+  else if (cqe->res < 0)
   {
     ret = cqe->res;
     io_uring_cqe_seen(&aio_ring, cqe);
     *data->io_error = true;
-    
+
     if (data->is_read)
       fprintf(stderr, "error reading %s: %s\n", data->src_name, strerror(-ret));
     else
-      fprintf(stderr, "error writing %s: %s\n", data->dst_name, strerror(-ret)); 
+      fprintf(stderr, "error writing %s: %s\n", data->dst_name, strerror(-ret));
     aio_free_data(data);
     if (write_comp) *write_comp = true;
-  } 
+  }
   // a successful read launches the corresponding write
   else if (data->is_read)
   {
@@ -466,7 +466,7 @@ void aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
     aio_submit(1, data->cnt, data->dst_name, false);
   }
   // a successful write results in an available entry in AIO queue and an availble AIO buffer
-  else 
+  else
   {
     io_uring_cqe_seen(&aio_ring, cqe);
     aio_free_data(data);
@@ -481,7 +481,7 @@ void aio_wait_all_comp()
   while (inflight > 0)
   {
       int ret = io_uring_wait_cqe(&aio_ring, &cqe);
-      if (ret < 0) 
+      if (ret < 0)
       {
           fprintf(stderr, "error getting completed I/O requests: %s\n", strerror(-ret));
           aio_exit(true);
@@ -515,18 +515,18 @@ sparse_copy (int src_fd, int dest_fd,
   off_t offset = start_offset;
   int ret;
 
-  while (max_n_read) 
+  while (max_n_read)
   {
     int ready = 0;
 
     // prepare as many reads as possible
-    while (max_n_read && inflight + ready < QD) 
+    while (max_n_read && inflight + ready < QD)
     {
       off_t io_size = (max_n_read < AIO_BLKSIZE) ? max_n_read : AIO_BLKSIZE;
 
       struct aio_data *data = NULL;
       data = (struct aio_data *)malloc(sizeof(struct aio_data));
-      if (data == NULL) 
+      if (data == NULL)
       {
         fprintf(stderr, "error allocating aio_data when reading %s\n", src_name);
         if (ready) aio_submit(ready, cnt, src_name, true);
@@ -563,7 +563,7 @@ sparse_copy (int src_fd, int dest_fd,
     if (ready) aio_submit(ready, cnt, src_name, true);
 
     // process events from completed requests
-    if (inflight >= QD) 
+    if (inflight >= QD)
     {
       struct io_uring_cqe *cqe;
       struct aio_data *data;
@@ -571,16 +571,16 @@ sparse_copy (int src_fd, int dest_fd,
       while (1)
       {
         // use unblocked wait to get more available events
-        if (write_comp) 
+        if (write_comp)
         {
           ret = io_uring_peek_cqe(&aio_ring, &cqe);
           if (ret == -EAGAIN) break;  // break the loop if no available events
         }
         // use blocked wait to get at least one event
-        else 
+        else
           ret = io_uring_wait_cqe(&aio_ring, &cqe);
-        
-        if (ret < 0) 
+
+        if (ret < 0)
         {
           fprintf(stderr, "error getting completed I/O requests: %s\n", strerror(-ret));
           aio_exit(true);
@@ -591,7 +591,7 @@ sparse_copy (int src_fd, int dest_fd,
       }
     }
   }
-  
+
   return true;
 }
 
@@ -1333,7 +1333,7 @@ copy_reg (char const *src_name, char const *dst_name,
       free(cnt);
       free(all_read_submit);
       free(io_error);
-      return false;    
+      return false;
     }
 
   *cnt = 0;
@@ -1433,7 +1433,7 @@ copy_reg (char const *src_name, char const *dst_name,
       dest_desc = open (dst_name, open_flags | O_EXCL,
                         dst_mode & ~omitted_permissions);
       dest_errno = errno;
-      
+
       /* When trying to copy through a dangling destination symlink,
          the above open fails with EEXIST.  If that happens, and
          lstat'ing the DST_NAME shows that it is a symlink, then we
@@ -1613,14 +1613,14 @@ copy_reg (char const *src_name, char const *dst_name,
               goto close_src_and_dst_desc;
             }
           else
-            *io_error = false;          
+            *io_error = false;
         }
 
       off_t n_read;
       bool wrote_hole_at_eof;
       aio_start = true;
       ok = sparse_copy (source_desc, dest_desc, make_holes ? hole_size : 0,
-                        x->sparse_mode == SPARSE_ALWAYS, src_name_clone, 
+                        x->sparse_mode == SPARSE_ALWAYS, src_name_clone,
                         dst_name_clone, src_open_sb.st_size, &n_read,
                         0, cnt, all_read_submit, io_error,
                         &wrote_hole_at_eof);
@@ -3318,7 +3318,7 @@ copy (char const *src_name, char const *dst_name,
 
   // initialize AIO buffer queue
   int ret = io_uring_queue_init(QD, &aio_ring, 0);
-  if (ret < 0) 
+  if (ret < 0)
   {
     fprintf(stderr, "error initializing io_uring: %s\n", strerror(-ret));
     return false;
