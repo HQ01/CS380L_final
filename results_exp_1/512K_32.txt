@@ -1,0 +1,120 @@
+exp 1:
+	Command being timed: "./cp_uring_multi src_1G dst_1G"
+	User time (seconds): 0.04
+	System time (seconds): 0.48
+	Percent of CPU this job got: 3%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.92
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 19008
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8
+	Minor (reclaiming a frame) page faults: 4242
+	Voluntary context switches: 4103
+	Involuntary context switches: 12
+	Swaps: 0
+	File system inputs: 2065016
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 2:
+	Command being timed: "./cp_uring_multi src_1G dst_1G"
+	User time (seconds): 0.03
+	System time (seconds): 0.50
+	Percent of CPU this job got: 3%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.93
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 19052
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8
+	Minor (reclaiming a frame) page faults: 4242
+	Voluntary context switches: 4089
+	Involuntary context switches: 2
+	Swaps: 0
+	File system inputs: 2064440
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 3:
+	Command being timed: "./cp_uring_multi src_1G dst_1G"
+	User time (seconds): 0.01
+	System time (seconds): 0.52
+	Percent of CPU this job got: 3%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.93
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 18908
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8
+	Minor (reclaiming a frame) page faults: 4239
+	Voluntary context switches: 4091
+	Involuntary context switches: 2
+	Swaps: 0
+	File system inputs: 2064952
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 4:
+	Command being timed: "./cp_uring_multi src_1G dst_1G"
+	User time (seconds): 0.02
+	System time (seconds): 0.50
+	Percent of CPU this job got: 3%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.86
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 18856
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8
+	Minor (reclaiming a frame) page faults: 4238
+	Voluntary context switches: 4078
+	Involuntary context switches: 2
+	Swaps: 0
+	File system inputs: 2064952
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 5:
+	Command being timed: "./cp_uring_multi src_1G dst_1G"
+	User time (seconds): 0.03
+	System time (seconds): 0.50
+	Percent of CPU this job got: 3%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.10
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 19040
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 8
+	Minor (reclaiming a frame) page faults: 4241
+	Voluntary context switches: 4091
+	Involuntary context switches: 9
+	Swaps: 0
+	File system inputs: 2063464
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
