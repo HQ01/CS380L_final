@@ -5,10 +5,10 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-#define SIZE 1 << 20
+#define SIZE 1 << 8
 
 int main () {
-    int fd = open("./src_1G", O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU);
+    int fd = open("./src_4M", O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU);
     char buf[SIZE];
     for (int j = 0; j < 1024; j++) {
         for (int i = 0; i < SIZE; i++) 
