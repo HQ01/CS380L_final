@@ -374,9 +374,11 @@ void aio_prep_rw(struct aio_data *data)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&aio_ring);
   if (data->is_read)
-      io_uring_prep_readv(sqe, data->src_fd, &aio_buf[data->buf_index], 1, data->offset);
+      io_uring_prep_read_fixed(sqe, data->src_fd, aio_buf[data->buf_index].iov_base, 
+                               aio_buf[data->buf_index].iov_len, data->offset, data->buf_index);
   else 
-      io_uring_prep_writev(sqe, data->dst_fd, &aio_buf[data->buf_index], 1, data->offset);
+      io_uring_prep_write_fixed(sqe, data->dst_fd, aio_buf[data->buf_index].iov_base, 
+                                aio_buf[data->buf_index].iov_len, data->offset, data->buf_index);
   io_uring_sqe_set_data(sqe, data);
 
   // if (data->is_read)
