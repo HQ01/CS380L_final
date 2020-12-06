@@ -38,7 +38,8 @@ int aio_buf_queue_init() {
     {
         // allocate aio buffer
         aio_buf[i].iov_base = NULL;
-        aio_buf[i].iov_base = malloc(AIO_BLKSIZE);
+        // aio_buf[i].iov_base = malloc(AIO_BLKSIZE);
+        posix_memalign((void **)&aio_buf[i].iov_base, 4096, AIO_BLKSIZE);
         if (aio_buf[i].iov_base == NULL)
         {
             fprintf(stderr, "Error in allocating aio buffer\n");
