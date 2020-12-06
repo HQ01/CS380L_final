@@ -24,6 +24,7 @@
 #include <selinux/selinux.h>
 #include <liburing.h>
 #include <math.h>
+#include <string.h>
 
 #if HAVE_HURD_H
 # include <hurd.h>
@@ -37,7 +38,7 @@
 #include "backupfile.h"
 #include "buffer-lcm.h"
 #include "canonicalize.h"
-#include "copy_uring.h"
+#include "copy_uring_multi.h"
 #include "cp-hash.h"
 #include "extent-scan.h"
 #include "die.h"
@@ -143,8 +144,13 @@ struct aio_data {
     off_t offset;
     int buf_index;
     bool is_read;
-    char const *src_name;
-    char const *dst_name;
+    char *src_name;
+    char *dst_name;
+
+    // pointers used for multi-file concurrent cp
+    int *cnt;                       // count of inflight I/O for (src, dst) pair
+    bool *all_read_submit;          // whether all reads for (src, dst) pair are submitted
+    bool *io_error;                 // whether error is encountered for (src, dst) pair
 };
 
 struct io_uring aio_ring;
@@ -210,9 +216,9 @@ int aio_buf_dequeue()
 void aio_exit(bool fatal_error);
 void aio_free_data(struct aio_data *data);
 void aio_prep_rw(struct aio_data *data);
-void aio_submit(int ready, char const *file_name, bool is_read);
-bool aio_proc_cqe(struct io_uring_cqe *cqe, off_t *total_n_read, bool *write_comp, bool io_error);
-bool aio_wait_all_comp(off_t *total_n_read, bool io_error);
+void aio_submit(int ready, int *cnt, char const *file_name, bool is_read);
+void aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp);
+void aio_wait_all_comp();
 
 
 static bool copy_internal (char const *src_name, char const *dst_name,
@@ -346,7 +352,20 @@ void aio_free_data(struct aio_data *data)
   {
     fprintf(stderr, "error releasing buffer back to AIO buffer queue\n");
     aio_exit(true);
-  } 
+  }
+
+  // close file when all requests are done
+  if (*data->cnt == 0 && *data->all_read_submit)
+  {
+    free(data->cnt);
+    free(data->all_read_submit);
+    free(data->io_error);
+    free(data->src_name);
+    free(data->dst_name);
+    close(data->src_fd);
+    close(data->dst_fd);
+  }
+
   free(data);
 }
 
@@ -369,7 +388,7 @@ void aio_prep_rw(struct aio_data *data)
 }
 
 /* AIO utils: submit prepared I/O requests */
-void aio_submit(int ready, char const *file_name, bool is_read)
+void aio_submit(int ready, int *cnt, char const *file_name, bool is_read)
 {
   int ret;
   while (ready) 
@@ -396,83 +415,77 @@ void aio_submit(int ready, char const *file_name, bool is_read)
 
     ready -= ret;
     inflight += ret;
+    *cnt += ret;
   }
 }
 
 /* AIO utils: process the completed I/O requests */
-bool aio_proc_cqe(struct io_uring_cqe *cqe, off_t *total_n_read, bool *write_comp, bool io_error)
+void aio_proc_cqe(struct io_uring_cqe *cqe, bool *write_comp)
 {
   int ret;
   struct aio_data *data = io_uring_cqe_get_data(cqe);
   inflight--;
+  (*data->cnt)--;
 
   // do not process the completed request if an I/O error has occured
-  if (io_error)
+  if (*data->io_error)
   {
     io_uring_cqe_seen(&aio_ring, cqe);
     aio_free_data(data);
-    return false;
+    if (write_comp) *write_comp = true;
   }
-
   // resubmit the request if I/O request is canceled or incomplete
-  if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != aio_buf[data->buf_index].iov_len))
+  else if (cqe->res == -EAGAIN || cqe->res == -ECANCELED || (cqe->res >= 0 && cqe->res != aio_buf[data->buf_index].iov_len))
   {
     aio_prep_rw(data);
     io_uring_cqe_seen(&aio_ring, cqe);
-    aio_submit(1, data->is_read ? data->src_name : data->dst_name, data->is_read);
+    aio_submit(1, data->cnt, data->is_read ? data->src_name : data->dst_name, data->is_read);
   }
   // I/O error
   else if (cqe->res < 0) 
   {
     ret = cqe->res;
     io_uring_cqe_seen(&aio_ring, cqe);
+    *data->io_error = true;
     
     if (data->is_read)
       fprintf(stderr, "error reading %s: %s\n", data->src_name, strerror(-ret));
     else
       fprintf(stderr, "error writing %s: %s\n", data->dst_name, strerror(-ret)); 
     aio_free_data(data);
-    return false;
+    if (write_comp) *write_comp = true;
   } 
   // a successful read launches the corresponding write
   else if (data->is_read)
   {
-    *total_n_read += aio_buf[data->buf_index].iov_len;
     data->is_read = false;
     aio_prep_rw(data);
     io_uring_cqe_seen(&aio_ring, cqe);
-    aio_submit(1, data->dst_name, false);
+    aio_submit(1, data->cnt, data->dst_name, false);
   }
   // a successful write results in an available entry in AIO queue and an availble AIO buffer
   else 
   {
     io_uring_cqe_seen(&aio_ring, cqe);
-    // if cnt is reduced to 0, close file
     aio_free_data(data);
     if (write_comp) *write_comp = true;
   }
-
-  return true;
 }
 
-/* AIO utils: wait for all inflight requests to complete
-   It returns false if any completed request gives an error, but does not
-   return immediately when error of a request occurs. */
-bool aio_wait_all_comp(off_t *total_n_read, bool io_error)
+/* AIO utils: wait for all inflight requests to complete */
+void aio_wait_all_comp()
 {
   struct io_uring_cqe *cqe;
   while (inflight > 0)
   {
-      // fprintf(stderr, "inflight: %d\n", inflight);
       int ret = io_uring_wait_cqe(&aio_ring, &cqe);
       if (ret < 0) 
       {
           fprintf(stderr, "error getting completed I/O requests: %s\n", strerror(-ret));
           aio_exit(true);
       }
-      io_error |= !aio_proc_cqe(cqe, total_n_read, NULL, io_error);
+      aio_proc_cqe(cqe, NULL);
   }
-  return !io_error;
 }
 
 /* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
@@ -489,10 +502,10 @@ bool aio_wait_all_comp(off_t *total_n_read, bool io_error)
 static bool
 sparse_copy (int src_fd, int dest_fd,
              size_t hole_size, bool punch_holes,
-             char const *src_name, char const *dst_name,
+             char *src_name, char *dst_name,
              uintmax_t max_n_read, off_t *total_n_read,
-             int start_offset, //AIO
-             bool *last_write_made_hole)
+             int start_offset, int *cnt, bool *all_read_submit,
+             bool *io_error, bool *last_write_made_hole)
 {
   *last_write_made_hole = false;
   *total_n_read = 0;
@@ -514,8 +527,8 @@ sparse_copy (int src_fd, int dest_fd,
       if (data == NULL) 
       {
         fprintf(stderr, "error allocating aio_data when reading %s\n", src_name);
-        if (ready) aio_submit(ready, src_name, true);
-        aio_wait_all_comp(total_n_read, true);
+        if (ready) aio_submit(ready, cnt, src_name, true);
+        *io_error = true;
         return false;
       }
 
@@ -532,16 +545,20 @@ sparse_copy (int src_fd, int dest_fd,
       data->is_read = true;
       data->src_name = src_name;
       data->dst_name = dst_name;
+      data->cnt = cnt;
+      data->all_read_submit = all_read_submit;
+      data->io_error = io_error;
 
       aio_prep_rw(data);
 
       offset += io_size;
       max_n_read -= io_size;
+      *total_n_read += io_size;
       ready++;
     }
 
     // submit prepared I/O requests
-    if (ready) aio_submit(ready, src_name, true);
+    if (ready) aio_submit(ready, cnt, src_name, true);
 
     // process events from completed requests
     if (inflight >= QD) 
@@ -551,12 +568,14 @@ sparse_copy (int src_fd, int dest_fd,
       bool write_comp = false;
       while (1)
       {
-        if (write_comp) // use unblocked wait to get more available events
+        // use unblocked wait to get more available events
+        if (write_comp) 
         {
           ret = io_uring_peek_cqe(&aio_ring, &cqe);
           if (ret == -EAGAIN) break;  // break the loop if no available events
         }
-        else // use blocked wait to get at least one event
+        // use blocked wait to get at least one event
+        else 
           ret = io_uring_wait_cqe(&aio_ring, &cqe);
         
         if (ret < 0) 
@@ -565,17 +584,13 @@ sparse_copy (int src_fd, int dest_fd,
           aio_exit(true);
         }
 
-        if (!aio_proc_cqe(cqe, total_n_read, &write_comp, false)) return aio_wait_all_comp(total_n_read, true);
+        aio_proc_cqe(cqe, &write_comp);
+        if (*io_error) return false;
       }
     }
   }
-  // fprintf(stderr, "All reads are submitted\n");
-
-  // bool ok = aio_wait_all_comp(total_n_read, false);
-  // fprintf(stderr, "%s: all requests are done\n", ok ? "Success" : "Failure");
-  // fprintf(stderr, "queue head: %d; queue tail: %d\n", aio_buf_qhead, aio_buf_qtail);
-  // return ok;
-  return aio_wait_all_comp(total_n_read, false);
+  
+  return true;
 }
 
 /* Perform the O(1) btrfs clone operation, if possible.
@@ -637,8 +652,9 @@ static bool
 extent_copy (int src_fd, int dest_fd,
              size_t hole_size, off_t src_total_size,
              enum Sparse_type sparse_mode,
-             char const *src_name, char const *dst_name,
-             bool *require_normal_copy)
+             char *src_name, char *dst_name,
+             bool *require_normal_copy,
+             int *cnt, bool *all_read_submit, bool *io_error)
 {
   struct extent_scan scan;
   off_t last_ext_start = 0;
@@ -772,7 +788,7 @@ extent_copy (int src_fd, int dest_fd,
               if ( ! sparse_copy (src_fd, dest_fd,
                                   sparse_mode == SPARSE_ALWAYS ? hole_size: 0,
                                   true, src_name, dst_name, ext_len, &n_read,
-                                  dest_pos,
+                                  dest_pos, cnt, all_read_submit, io_error,
                                   &read_hole))
                 goto fail;
 
@@ -1281,6 +1297,47 @@ copy_reg (char const *src_name, char const *dst_name,
   bool return_val = true;
   bool data_copy_required = x->data_copy_required;
 
+  char *src_name_clone = NULL;
+  char *dst_name_clone = NULL;
+  src_name_clone = (char *)malloc(strlen(src_name) + 1);
+  dst_name_clone = (char *)malloc(strlen(dst_name) + 1);
+
+  if (src_name_clone == NULL || dst_name_clone == NULL)
+    {
+      fprintf(stderr, "error allocating name string when copying from %s to %s\n",
+              src_name, dst_name);
+      free(src_name_clone);
+      free(dst_name_clone);
+      return false;
+    }
+
+  strcpy(src_name_clone, src_name);
+  strcpy(dst_name_clone, dst_name);
+
+  bool aio_start = false;
+  int *cnt = NULL;
+  bool *all_read_submit = NULL;
+  bool *io_error = NULL;
+  cnt = (int *)malloc(sizeof(int));
+  all_read_submit = (bool *)malloc(sizeof(bool));
+  io_error = (bool *)malloc(sizeof(bool));
+
+  if (cnt == NULL || all_read_submit == NULL || io_error == NULL)
+    {
+      fprintf(stderr, "error allocating AIO-related var when copying from %s to %s\n",
+              src_name, dst_name);
+      free(src_name_clone);
+      free(dst_name_clone);
+      free(cnt);
+      free(all_read_submit);
+      free(io_error);
+      return false;    
+    }
+
+  *cnt = 0;
+  *all_read_submit = false;
+  *io_error = false;
+
   source_desc = open (src_name,
                       (O_RDONLY | O_BINARY
                        | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
@@ -1476,6 +1533,8 @@ copy_reg (char const *src_name, char const *dst_name,
 
   if (data_copy_required)
     {
+      bool ok;
+
       /* Choose a suitable buffer size; it may be adjusted later.  */
       // size_t buf_alignment = getpagesize ();
       // size_t buf_size = io_blksize (sb);
@@ -1537,27 +1596,36 @@ copy_reg (char const *src_name, char const *dst_name,
              standard copy only if the initial extent scan fails.  If the
              '--sparse=never' option is specified, write all data but use
              any extents to read more efficiently.  */
-          if (extent_copy (source_desc, dest_desc, hole_size,
-                           src_open_sb.st_size,
-                           make_holes ? x->sparse_mode : SPARSE_NEVER,
-                           src_name, dst_name, &normal_copy_required))
-            goto preserve_metadata;
+          aio_start = true;
+          ok = extent_copy (source_desc, dest_desc, hole_size, src_open_sb.st_size,
+                            make_holes ? x->sparse_mode : SPARSE_NEVER,
+                            src_name_clone, dst_name_clone, &normal_copy_required,
+                            cnt, all_read_submit, io_error);
+          if (*cnt == 0) aio_start = false;
+          else if (ok || !normal_copy_required) *all_read_submit = true;
 
+          if (ok) goto preserve_metadata;
           if (! normal_copy_required)
             {
               return_val = false;
               goto close_src_and_dst_desc;
             }
+          else
+            *io_error = false;          
         }
 
       off_t n_read;
       bool wrote_hole_at_eof;
-      if (! sparse_copy (source_desc, dest_desc,
-                         make_holes ? hole_size : 0,
-                         x->sparse_mode == SPARSE_ALWAYS, src_name, dst_name,
-                         src_open_sb.st_size, &n_read,
-                         0,
-                         &wrote_hole_at_eof))
+      aio_start = true;
+      ok = sparse_copy (source_desc, dest_desc, make_holes ? hole_size : 0,
+                        x->sparse_mode == SPARSE_ALWAYS, src_name_clone, 
+                        dst_name_clone, src_open_sb.st_size, &n_read,
+                        0, cnt, all_read_submit, io_error,
+                        &wrote_hole_at_eof);
+      if (*cnt == 0) aio_start = false;
+      else *all_read_submit = true;
+
+      if (!ok)
         {
           return_val = false;
           goto close_src_and_dst_desc;
@@ -1657,16 +1725,27 @@ preserve_metadata:
     }
 
 close_src_and_dst_desc:
-  if (close (dest_desc) < 0)
+  if (!aio_start)
     {
-      error (0, errno, _("failed to close %s"), quoteaf (dst_name));
-      return_val = false;
+      if (close (dest_desc) < 0)
+        {
+          error (0, errno, _("failed to close %s"), quoteaf (dst_name));
+          return_val = false;
+        }
     }
 close_src_desc:
-  if (close (source_desc) < 0)
+  if (!aio_start)
     {
-      error (0, errno, _("failed to close %s"), quoteaf (src_name));
-      return_val = false;
+      if (close (source_desc) < 0)
+        {
+          error (0, errno, _("failed to close %s"), quoteaf (src_name));
+          return_val = false;
+        }
+      free(cnt);
+      free(all_read_submit);
+      free(io_error);
+      free(src_name_clone);
+      free(dst_name_clone);
     }
 
   // free (buf_alloc);
@@ -3272,6 +3351,7 @@ copy (char const *src_name, char const *dst_name,
                           &first_dir_created_per_command_line_arg,
                           copy_into_self, rename_succeeded);
 
+  aio_wait_all_comp();
   aio_exit(false);
   return ok;
 }
