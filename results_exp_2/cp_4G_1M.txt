@@ -1,0 +1,120 @@
+exp 1:
+	Command being timed: "./cp -r rec_4G_1M rec_dst_4G_1M"
+	User time (seconds): 0.09
+	System time (seconds): 8.74
+	Percent of CPU this job got: 12%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:09.37
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2824
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 238
+	Voluntary context switches: 1167477
+	Involuntary context switches: 115
+	Swaps: 0
+	File system inputs: 8389392
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 2:
+	Command being timed: "./cp -r rec_4G_1M rec_dst_4G_1M"
+	User time (seconds): 0.10
+	System time (seconds): 7.75
+	Percent of CPU this job got: 15%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.41
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2788
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 235
+	Voluntary context switches: 1167481
+	Involuntary context switches: 97
+	Swaps: 0
+	File system inputs: 8389392
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 3:
+	Command being timed: "./cp -r rec_4G_1M rec_dst_4G_1M"
+	User time (seconds): 0.09
+	System time (seconds): 7.87
+	Percent of CPU this job got: 15%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:50.97
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2872
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 237
+	Voluntary context switches: 1167534
+	Involuntary context switches: 40
+	Swaps: 0
+	File system inputs: 8389392
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 4:
+	Command being timed: "./cp -r rec_4G_1M rec_dst_4G_1M"
+	User time (seconds): 0.15
+	System time (seconds): 7.69
+	Percent of CPU this job got: 14%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:52.85
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2760
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 236
+	Voluntary context switches: 1167539
+	Involuntary context switches: 19
+	Swaps: 0
+	File system inputs: 8389392
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exp 5:
+	Command being timed: "./cp -r rec_4G_1M rec_dst_4G_1M"
+	User time (seconds): 0.08
+	System time (seconds): 7.96
+	Percent of CPU this job got: 15%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:52.65
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2932
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 6
+	Minor (reclaiming a frame) page faults: 239
+	Voluntary context switches: 1167537
+	Involuntary context switches: 24
+	Swaps: 0
+	File system inputs: 8389392
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
