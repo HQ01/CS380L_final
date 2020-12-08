@@ -21,3 +21,7 @@ DIR_SRC=~/project/CS380L_final
 gcc -I ${DIR_COREUTILS}/lib/ -I ${DIR_COREUTILS}/src/ -I ${DIR_COREUTILS} -L ${DIR_COREUTILS}/lib/ -L ${DIR_COREUTILS}/src/ -o cp_uring_multi ${DIR_SRC}/copy_uring_multi.c ${DIR_SRC}/cp_uring_multi.c ${DIR_SRC}/cp-hash.c ${DIR_SRC}/extent-scan.c ${DIR_SRC}/force-link.c ${DIR_SRC}/selinux.c -lcoreutils -lver -lcrypt -laio -lselinux -luring
 ```
 Run ```./cp_uring_multi``` with same arguments and options as ```cp```
+
+Patches
+----
+The patches for ```cp_uring``` are in patch directory
